@@ -1,0 +1,11 @@
+name = "cf-tunnel"
+main = "_worker.js"
+compatibility_date = "2024-12-01"
+
+[[durable_objects.bindings]]
+name = "TUNNEL_DO"
+class_name = "TunnelDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TunnelDO"]
