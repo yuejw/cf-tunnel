@@ -11,6 +11,13 @@
 
 import * as net from 'node:net';
 
+// Node.js 版本检查（依赖内置 WebSocket）
+const NODE_MAJOR = parseInt(process.versions.node.split('.')[0], 10);
+if (NODE_MAJOR < 22) {
+	console.error(`Error: Node.js 22+ required, found ${process.versions.node}`);
+	process.exit(1);
+}
+
 // 协议常量
 const CMD_PING = 0xFF;
 const CMD_PONG = 0xFE;
@@ -41,24 +48,33 @@ function parseArgs() {
 		process.exit(1);
 	}
 
+	const parsePort = (v, label) => {
+		const p = parseInt(v, 10);
+		if (isNaN(p) || p < 1 || p > 65535) {
+			console.error(`Invalid ${label}: ${v} (must be 1-65535)`);
+			process.exit(1);
+		}
+		return p;
+	};
+
 	const config = { server, mode };
 
 	if (mode === 'L') {
 		if (parts.length !== 4) { console.error('格式: https://server/L/<localPort>/<targetHost>/<targetPort>'); process.exit(1); }
-		config.localPort = { localPort: +parts[1], targetHost: parts[2], targetPort: +parts[3] };
+		config.localPort = { localPort: parsePort(parts[1], 'localPort'), targetHost: parts[2], targetPort: parsePort(parts[3], 'targetPort') };
 	} else if (mode === 'R') {
 		if (parts.length < 3 || parts.length > 4) { console.error('格式: https://server/R/<localPort>/<tunnelId> 或 https://server/R/<localHost>/<localPort>/<tunnelId>'); process.exit(1); }
 		if (parts.length === 4) {
-			config.remoteForward = { localHost: parts[1], localPort: +parts[2], tunnelId: parts[3] };
+			config.remoteForward = { localHost: parts[1], localPort: parsePort(parts[2], 'localPort'), tunnelId: parts[3] };
 		} else {
-			config.remoteForward = { localHost: '127.0.0.1', localPort: +parts[1], tunnelId: parts[2] };
+			config.remoteForward = { localHost: '127.0.0.1', localPort: parsePort(parts[1], 'localPort'), tunnelId: parts[2] };
 		}
 	} else if (mode === 'C') {
 		if (parts.length !== 3) { console.error('格式: https://server/C/<localPort>/<tunnelId>'); process.exit(1); }
-		config.connectTunnel = { localPort: +parts[1], tunnelId: parts[2] };
+		config.connectTunnel = { localPort: parsePort(parts[1], 'localPort'), tunnelId: parts[2] };
 	} else if (mode === 'D') {
 		if (parts.length !== 2) { console.error('格式: https://server/D/<localPort>'); process.exit(1); }
-		config.dynamicPort = +parts[1];
+		config.dynamicPort = parsePort(parts[1], 'localPort');
 	}
 
 	return config;
@@ -93,63 +109,70 @@ async function toBuffer(data) {
 }
 
 // ============================================================
+// 公共：桥接本地 TCP socket ↔ 远程 WebSocket
+// onOpen 在 WebSocket 打开时调用，可发送首帧（如目标地址）
+// ============================================================
+function bridgeSocket(socket, ws, label, onOpen) {
+	let connected = false;
+	const pendingData = [];
+
+	ws.addEventListener('open', () => {
+		if (onOpen) onOpen();
+		connected = true;
+		for (const chunk of pendingData) {
+			if (ws.readyState === WebSocket.OPEN) ws.send(chunk);
+		}
+		pendingData.length = 0;
+	});
+
+	ws.addEventListener('message', async (event) => {
+		const data = await toBuffer(event.data);
+		if (data.length === 1 && data[0] === CMD_PONG) return;
+		socket.write(data);
+	});
+
+	ws.addEventListener('close', (event) => {
+		console.log(`[${label}] WebSocket closed: ${event.code} ${event.reason}`);
+		socket.destroy();
+	});
+
+	ws.addEventListener('error', (err) => {
+		console.error(`[${label}] WebSocket error: ${err.message}`);
+		socket.destroy();
+	});
+
+	socket.on('data', (chunk) => {
+		if (connected && ws.readyState === WebSocket.OPEN) {
+			ws.send(chunk);
+		} else {
+			pendingData.push(chunk);
+		}
+	});
+
+	socket.on('close', () => {
+		if (ws.readyState === WebSocket.OPEN) ws.close();
+	});
+
+	socket.on('error', (err) => {
+		console.error(`[${label}] Socket error: ${err.message}`);
+		if (ws.readyState === WebSocket.OPEN) ws.close();
+	});
+}
+
+// ============================================================
 // -L 模式：本地端口转发
 // ============================================================
 function startLocalForward(config) {
 	const { localPort, targetHost, targetPort } = config.localPort;
 
 	const server = net.createServer((socket) => {
+		socket.setTimeout(120000);
 		const wsUrl = `${config.server}/proxy`.replace('http', 'ws');
 		console.log(`[L] New connection -> ${targetHost}:${targetPort}`);
 
 		const ws = new WebSocket(wsUrl);
-		let connected = false;
-		let pendingData = [];
-
-		ws.addEventListener('open', () => {
-			// 发送目标地址（二进制格式）
+		bridgeSocket(socket, ws, 'L', () => {
 			ws.send(new TextEncoder().encode(targetHost + ':' + targetPort));
-			connected = true;
-			// 把缓冲的早期数据发出去
-			for (const chunk of pendingData) {
-				if (ws.readyState === WebSocket.OPEN) ws.send(chunk);
-			}
-			pendingData = [];
-		});
-
-		ws.addEventListener('message', async (event) => {
-			const data = await toBuffer(event.data);
-			if (data.length === 1 && data[0] === CMD_PONG) return;
-			socket.write(data);
-		});
-
-		ws.addEventListener('close', (event) => {
-			console.log(`[L] WebSocket closed: ${event.code} ${event.reason}`);
-			socket.destroy();
-		});
-
-		ws.addEventListener('error', (err) => {
-			console.error(`[L] WebSocket error: ${err.message}`);
-			socket.destroy();
-		});
-
-		// 本地 TCP 数据 → WebSocket
-		socket.on('data', (chunk) => {
-			if (connected && ws.readyState === WebSocket.OPEN) {
-				ws.send(chunk);
-			} else {
-				// WebSocket 还没准备好，先缓冲
-				pendingData.push(chunk);
-			}
-		});
-
-		socket.on('close', () => {
-			if (ws.readyState === WebSocket.OPEN) ws.close();
-		});
-
-		socket.on('error', (err) => {
-			console.error(`[L] Socket error: ${err.message}`);
-			if (ws.readyState === WebSocket.OPEN) ws.close();
 		});
 	});
 
@@ -166,10 +189,12 @@ function startDynamicForward(config) {
 	const port = config.dynamicPort;
 
 	const server = net.createServer((socket) => {
+		socket.setTimeout(120000);
 		let state = 'handshake';
 		let targetHost = '';
 		let targetPort = 0;
 		let ws = null;
+		const pendingData = [];
 
 		const cleanup = () => {
 			if (ws && ws.readyState === WebSocket.OPEN) ws.close();
@@ -219,6 +244,11 @@ function startDynamicForward(config) {
 					reply[0] = 0x05; reply[1] = 0x00; reply[2] = 0x00; reply[3] = 0x01;
 					socket.write(reply);
 					state = 'relay';
+					// 排空 connecting 期间缓冲的数据
+					for (const chunk of pendingData) {
+						if (ws.readyState === WebSocket.OPEN) ws.send(chunk);
+					}
+					pendingData.length = 0;
 					console.log(`[D] Connected: ${targetHost}:${targetPort}`);
 				});
 
@@ -241,6 +271,8 @@ function startDynamicForward(config) {
 				});
 
 				state = 'connecting';
+			} else if (state === 'connecting') {
+				pendingData.push(chunk);
 			} else if (state === 'relay') {
 				if (ws && ws.readyState === WebSocket.OPEN) ws.send(chunk);
 			}
@@ -259,7 +291,7 @@ function startDynamicForward(config) {
 // ============================================================
 // -R 模式：远程转发（注册隧道）
 // ============================================================
-function startRemoteForward(config) {
+function startRemoteForward(config, retryCount = 0) {
 	const { localHost, localPort, tunnelId } = config.remoteForward;
 	const wsUrl = `${config.server}/tunnel/register?id=${tunnelId}`.replace('http', 'ws');
 
@@ -279,16 +311,22 @@ function startRemoteForward(config) {
 		if (data.length < 1) return;
 		const cmd = data[0];
 
+		if (cmd === CMD_PING) {
+			if (ws.readyState === WebSocket.OPEN) ws.send(new Uint8Array([CMD_PONG]));
+			return;
+		}
 		if (cmd === CMD_PONG) return;
 
 		if (cmd === CMD_TUNNEL_NEW) {
-			const connId = data.subarray(1).toString();
+			const connId = data.subarray(2, 2 + data[1]).toString();
 			console.log(`[R] New connection: ${connId}`);
 
-			const localSocket = net.createConnection({ host: localHost, port: localPort }, () => {
-				console.log(`[R] Local connected for ${connId}`);
+			const localSocket = new net.Socket();
+			// error 监听器必须先注册，防止连接立即失败时触发未处理异常
+			localSocket.on('error', (err) => {
+				console.error(`[R] Local error (${connId}): ${err.message}`);
+				localSocket.destroy();
 			});
-			connections.set(connId, localSocket);
 
 			localSocket.on('data', (chunk) => {
 				const idBuf = Buffer.from(connId);
@@ -310,9 +348,10 @@ function startRemoteForward(config) {
 				connections.delete(connId);
 			});
 
-			localSocket.on('error', (err) => {
-				console.error(`[R] Local error (${connId}): ${err.message}`);
-				localSocket.destroy();
+			localSocket.setTimeout(120000);
+			connections.set(connId, localSocket);
+			localSocket.connect({ host: localHost, port: localPort }, () => {
+				console.log(`[R] Local connected for ${connId}`);
 			});
 			return;
 		}
@@ -339,8 +378,9 @@ function startRemoteForward(config) {
 		console.log(`[R] Disconnected: ${event.code}`);
 		for (const [, sock] of connections) sock.destroy();
 		connections.clear();
-		console.log(`[R] Reconnecting in 3s...`);
-		setTimeout(() => startRemoteForward(config), 3000);
+		const delay = Math.min(1000 * Math.pow(2, retryCount), 60000);
+		console.log(`[R] Reconnecting in ${delay / 1000}s (attempt ${retryCount + 1})...`);
+		setTimeout(() => startRemoteForward(config, retryCount + 1), delay);
 	});
 
 	ws.addEventListener('error', (err) => {
@@ -355,53 +395,13 @@ function startConnectTunnel(config) {
 	const { localPort, tunnelId } = config.connectTunnel;
 
 	const server = net.createServer((socket) => {
+		socket.setTimeout(120000);
 		const wsUrl = `${config.server}/tunnel/connect/${tunnelId}`.replace('http', 'ws');
 		console.log(`[C] New connection -> tunnel "${tunnelId}"`);
 
 		const ws = new WebSocket(wsUrl);
-		let connected = false;
-		const pendingData = [];
-
-		ws.addEventListener('open', () => {
+		bridgeSocket(socket, ws, 'C', () => {
 			console.log(`[C] Connected to tunnel "${tunnelId}"`);
-			connected = true;
-			for (const chunk of pendingData) {
-				if (ws.readyState === WebSocket.OPEN) ws.send(chunk);
-			}
-			pendingData.length = 0;
-		});
-
-		ws.addEventListener('message', async (event) => {
-			const data = await toBuffer(event.data);
-			if (data.length === 1 && data[0] === CMD_PONG) return;
-			socket.write(data);
-		});
-
-		ws.addEventListener('close', (event) => {
-			console.log(`[C] Closed: ${event.code} ${event.reason}`);
-			socket.destroy();
-		});
-
-		ws.addEventListener('error', (err) => {
-			console.error(`[C] Error: ${err.message}`);
-			socket.destroy();
-		});
-
-		socket.on('data', (chunk) => {
-			if (connected && ws.readyState === WebSocket.OPEN) {
-				ws.send(chunk);
-			} else {
-				pendingData.push(chunk);
-			}
-		});
-
-		socket.on('close', () => {
-			if (ws.readyState === WebSocket.OPEN) ws.close();
-		});
-
-		socket.on('error', (err) => {
-			console.error(`[C] Socket error: ${err.message}`);
-			if (ws.readyState === WebSocket.OPEN) ws.close();
 		});
 	});
 
@@ -425,3 +425,11 @@ switch (config.mode) {
 	case 'R': startRemoteForward(config); break;
 	case 'C': startConnectTunnel(config); break;
 }
+
+// 优雅退出
+const shutdown = () => {
+	console.log('\nShutting down...');
+	process.exit(0);
+};
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);

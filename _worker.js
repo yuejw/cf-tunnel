@@ -19,12 +19,11 @@ const CMD_PONG = 0xFE;
 // 每个 tunnelId 对应一个 DO 实例，所有连接必然路由到同一实例
 // ============================================================
 export class TunnelDO {
-	constructor(state, env) {
-		this.state = state;
-		this.env = env;
+	constructor(_state, _env) {
 		this.clientWs = null;        // -R 客户端的 WebSocket
 		this.connections = new Map(); // connId → visitorWs
 		this.heartbeatTimer = null;
+		this.lastPong = Date.now();
 	}
 
 	async fetch(request) {
@@ -52,19 +51,29 @@ export class TunnelDO {
 		server.accept();
 		server.binaryType = 'arraybuffer';
 
-		// 关闭旧连接
+		// 关闭旧连接及所有关联的访客 WebSocket
 		if (this.clientWs) {
 			try { this.clientWs.close(4003, 'Replaced by new connection') } catch {}
 			clearInterval(this.heartbeatTimer);
+			// 清空旧访客连接，防止数据错发到新客户端
+			for (const [, visitorWs] of this.connections) {
+				try { visitorWs.close(4003, 'Tunnel reconnected') } catch {}
+			}
+			this.connections.clear();
 		}
 
 		this.clientWs = server;
 
-		// 心跳
+		// 心跳（双向检测：发 PING，检查 PONG 超时）
 		this.heartbeatTimer = setInterval(() => {
-			if (server.readyState === WebSocket.OPEN) {
-				try { server.send(new Uint8Array([CMD_PING])) } catch {}
+			if (server.readyState !== WebSocket.OPEN) return;
+			// 60s 未收到 PONG 则认为连接已死
+			if (Date.now() - this.lastPong > 60000) {
+				console.log(`[DO] Tunnel client heartbeat timeout`);
+				try { server.close(4001, 'Heartbeat timeout') } catch {}
+				return;
 			}
+			try { server.send(new Uint8Array([CMD_PING])) } catch {}
 		}, 30000);
 
 		// -R 客户端发来的数据分发
@@ -72,7 +81,7 @@ export class TunnelDO {
 			const data = toUint8Array(event.data);
 			if (data.length < 2) return;
 			const cmd = data[0];
-			if (cmd === CMD_PONG) return;
+			if (cmd === CMD_PONG) { this.lastPong = Date.now(); return; }
 
 			if (cmd === CMD_TUNNEL_DATA || cmd === CMD_TUNNEL_CLOSE) {
 				const connIdLen = data[1];
@@ -124,21 +133,26 @@ export class TunnelDO {
 		const connIdBytes = new TextEncoder().encode(connId);
 
 		// 通知 -R 客户端：新连接
-		const newMsg = new Uint8Array(1 + connIdBytes.length);
+		const newMsg = new Uint8Array(1 + 1 + connIdBytes.length);
 		newMsg[0] = CMD_TUNNEL_NEW;
-		newMsg.set(connIdBytes, 1);
+		newMsg[1] = connIdBytes.length;
+		newMsg.set(connIdBytes, 2);
 		try {
 			this.clientWs.send(newMsg);
 		} catch {
 			try { visitorWs.close(4002, 'Failed to notify tunnel client') } catch {}
-			return new Response(null, { status: 101, webSocket: client });
+			try { client.close(4002, 'Failed to notify tunnel client') } catch {}
+			return jsonResponse({ error: 'Failed to notify tunnel client' }, 502);
 		}
 
 		// 桥接：visitor → -R 客户端
 		visitorWs.addEventListener('message', (event) => {
 			const data = toUint8Array(event.data);
-			if (data.length === 1 && data[0] === CMD_PING) {
-				try { visitorWs.send(new Uint8Array([CMD_PONG])) } catch {}
+			// 过滤应用层控制帧，不转发到隧道客户端
+			if (data.length === 1 && (data[0] === CMD_PING || data[0] === CMD_PONG)) {
+				if (data[0] === CMD_PING) {
+					try { visitorWs.send(new Uint8Array([CMD_PONG])) } catch {}
+				}
 				return;
 			}
 			const frame = new Uint8Array(1 + 1 + connIdBytes.length + data.length);
@@ -212,6 +226,9 @@ export default {
 		// -C：连接隧道 → 路由到 DO
 		if (path.startsWith('/tunnel/connect/')) {
 			const tunnelId = path.slice('/tunnel/connect/'.length);
+			if (!tunnelId || !/^[\w-]+$/.test(tunnelId)) {
+				return jsonResponse({ error: 'Invalid tunnel id' }, 400);
+			}
 			const id = env.TUNNEL_DO.idFromName(tunnelId);
 			const stub = env.TUNNEL_DO.get(id);
 			const doUrl = new URL(request.url);
@@ -222,6 +239,9 @@ export default {
 		// 隧道状态
 		if (path.startsWith('/tunnel/status/')) {
 			const tunnelId = path.slice('/tunnel/status/'.length);
+			if (!tunnelId || !/^[\w-]+$/.test(tunnelId)) {
+				return jsonResponse({ error: 'Invalid tunnel id' }, 400);
+			}
 			const id = env.TUNNEL_DO.idFromName(tunnelId);
 			const stub = env.TUNNEL_DO.get(id);
 			const doUrl = new URL(request.url);
@@ -283,6 +303,9 @@ function handleProxy(request) {
 
 		remoteSocket = connect({ hostname, port });
 		await remoteSocket.opened;
+
+		// 防止 await 期间 cleanup 已将 remoteSocket 置 null
+		if (!remoteSocket) return;
 
 		const reader = remoteSocket.readable.getReader();
 		const pump = async () => {
